@@ -1,0 +1,489 @@
+class ForumWebSocketClient {
+  constructor() {
+    this.socket = null;
+    this.token = null;
+    this.currentTopic = null;
+  }
+  // подключение к WebSocket серверу
+  connect(token) {
+    this.token = token;
+    this.socket = new WebSocket(`ws://localhost:5000?token=${this.token}`);
+
+    this.socket.onopen = () => {
+      console.log('WebSocket подключен');
+      if (this.currentTopic) {
+        this.joinTopic(this.currentTopic);
+      }
+    };
+    // обработка входящих сообщений
+    this.socket.onmessage = (event) => {
+      try {
+        const message = JSON.parse(event.data);
+        if (message.type === 'newReply') {
+          console.log('Новый ответ получен:', message.data);
+        }
+      } catch (err) {
+        console.error('Ошибка разбора сообщения:', err);
+      }
+    };
+
+    this.socket.onclose = () => {
+      console.log('WebSocket отключен');
+    };
+  }
+  // подписка на тем
+  joinTopic(topicId) {
+    this.currentTopic = topicId;
+    if (this.socket && this.socket.readyState === WebSocket.OPEN) {
+      this.socket.send(JSON.stringify({
+        type: 'joinTopic',
+        topicId
+      }));
+    }
+  }
+  // отправка ответа в тему
+  sendReply(content) {
+    if (this.socket && this.socket.readyState === WebSocket.OPEN && this.currentTopic) {
+      this.socket.send(JSON.stringify({
+        type: 'newReply',
+        topicId: this.currentTopic,
+        content
+      }));
+    }
+  }
+}
+
+
+
+const express = require("express");
+const cors = require("cors");
+const dotenv = require("dotenv");
+const http = require('http');
+const WebSocket = require('ws');
+const jwt = require("jsonwebtoken");
+const swaggerJsDoc = require("swagger-jsdoc");
+const swaggerUi = require("swagger-ui-express");
+
+const db = require("./db"); // Підключення до БД
+const userRoutes = require("./routes/userRoutes"); // Маршрути для користувачів
+const courseRoutes = require("./routes/courseRoutes"); // Маршрути для курсів
+const socketSetup = require("./socket"); // Налаштування WebSockets
+
+dotenv.config();
+const app = express();
+const ser = http.createServer(app);
+
+// Підключення до MySQL
+db.connect((err) => {
+  if (err) {
+    console.error("Помилка при підключенні до БД:", err);
+  } else {
+    console.log("Підключено до MySQL");
+  }
+});
+
+app.use(express.json()); // Додає підтримку JSON-запитів
+app.use(cors()); // Дозволяє CORS для взаємодії з іншими доменами
+
+// Підключення Swagger
+const swaggerOptions = {
+  swaggerDefinition: {
+    openapi: "3.0.0",
+    info: {
+      title: "Microservices API",
+      version: "1.0.0",
+      description: "Документація для вашого API",
+    },
+  },
+  apis: ["./routes/*.js"], // Шлях до ваших маршрутів
+};
+
+const swaggerDocs = swaggerJsDoc(swaggerOptions);
+app.use("/api-docs", swaggerUi.serve, swaggerUi.setup(swaggerDocs));
+
+// Підключення маршрутів
+app.use("/api/users", userRoutes);
+app.use("/api/courses", courseRoutes);
+// создаю WebSocket сервера
+const wss = new WebSocket.Server({ noServer: true });
+const topicSubscriptions = new Map(); // храню подписки на темы 
+
+// обрабатываю апгрейд соединения до WebSocketа
+ser.on('upgrade', (request, socket, head) => {
+  // проверка токена при подключении
+  const token = new URL(request.url, `http://${request.headers.host}`).searchParams.get('token');
+  
+  if (!token) {
+    socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n');
+    socket.destroy();
+    return;
+  }
+
+  try {
+    jwt.verify(token, process.env.JWT_SECRET);
+    wss.handleUpgrade(request, socket, head, (ws) => {
+      wss.emit('connection', ws, request);
+    });
+  } catch (err) {
+    socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n');
+    socket.destroy();
+  }
+});
+// событий подключения
+wss.on('connection', (ws, request) => {
+  console.log("Новое подключение WebSocket"); // Лог подключения
+
+  try {
+    const token = new URL(request.url, `http://${request.headers.host}`).searchParams.get('token');
+    const decoded = jwt.verify(token, process.env.JWT_SECRET);
+    ws.userId = decoded.id;
+
+    console.log(`Пользователь ${ws.userId} подключился`); // Лог пользователя
+
+    ws.on('message', (message) => {
+      try {
+        const data = JSON.parse(message);
+        // подписывается на тему
+        if (data.type === 'joinTopic') {
+          if (ws.topicId) {
+            const subscribers = topicSubscriptions.get(ws.topicId);
+            if (subscribers) subscribers.delete(ws);
+          }
+          ws.topicId = data.topicId;
+          if (!topicSubscriptions.has(data.topicId)) {
+            topicSubscriptions.set(data.topicId, new Set());
+          }
+          topicSubscriptions.get(data.topicId).add(ws);
+          console.log(`Пользователь ${ws.userId} присоединился к теме ${data.topicId}`);
+        }
+        // отправка нового ответа
+        if (data.type === 'newReply' && ws.topicId) {
+          // рассылаю ответы всем подписчикам темы
+          const messageToSend = JSON.stringify({
+            type: 'newReply',
+            data: {
+              topicId: ws.topicId,
+              content: data.content,
+              author: ws.userId,
+              createdAt: new Date()
+            }
+          });
+
+          const subscribers = topicSubscriptions.get(ws.topicId) || new Set();
+          subscribers.forEach(client => {
+            if (client.readyState === WebSocket.OPEN) {
+              client.send(messageToSend);
+            }
+          });
+        }
+      } catch (err) {
+        console.error('Ошибка обработки сообщения:', err);
+      }
+    });
+    
+
+    ws.on('close', () => {
+      console.log(`Пользователь ${ws.userId} отключился`);
+    });
+
+  } catch (err) {
+    console.error('Ошибка аутентификации:', err);
+    ws.close(1008, 'Ошибка аутентификации');
+  }
+});
+
+
+// WebSocket доступным в маршрутах
+app.set('wss', wss);
+app.set('topicSubscriptions', topicSubscriptions);
+
+// Старт сервера
+ser.listen(process.env.PORT, () => {
+  console.log(`Сервер працює на порту ${process.env.PORT}`);
+});
+
+
+
+
+
+const mysql = require('mysql2');
+
+require('dotenv').config(); // Загрузить переменные из .env
+
+const db = mysql.createConnection({
+  host: process.env.DB_HOST,
+  user: process.env.DB_USER,
+  password: process.env.DB_PASSWORD,
+  database: process.env.DB_NAME
+});
+
+db.connect(err => {
+  if (err) {
+    console.error('Ошибка подключения к базе данных:', err);
+    return;
+  }
+  console.log('Подключение к базе данных установлено');
+});
+
+module.exports = db;
+
+
+
+
+
+const jwt = require("jsonwebtoken");
+
+function authenticateJWT(req, res, next) {
+  const token = req.header("Authorization")?.split(" ")[1]; // Беремо токен з заголовка
+  if (!token) return res.status(403).json({ message: "Доступ заборонено" });
+
+  jwt.verify(token, process.env.JWT_SECRET, (err, user) => {
+    if (err) return res.status(403).json({ message: "Невірний токен" });
+    req.user = user;
+    next();
+  });
+}
+
+module.exports = { authenticateJWT };
+
+
+
+
+
+
+DB_HOST=localhost
+DB_USER=root
+DB_PASSWORD=0988626338Am
+DB_NAME=coursesdb
+JWT_SECRET=1234
+PORT=5000
+
+
+
+
+
+const express = require("express");
+const jwt = require("jsonwebtoken");
+const db = require("../db"); // Підключення до БД
+const router = express.Router();
+const { authenticateJWT } = require("../auth");
+
+/**
+ * @swagger
+ * components:
+ *   schemas:
+ *     Course:
+ *       type: object
+ *       required:
+ *         - title
+ *         - description
+ *         - instructor
+ *       properties:
+ *         id:
+ *           type: integer
+ *           description: ID курсу
+ *         title:
+ *           type: string
+ *           description: Назва курсу
+ *         description:
+ *           type: string
+ *           description: Опис курсу
+ *         instructor:
+ *           type: string
+ *           description: Викладач курсу
+ */
+
+/**
+ * @swagger
+ * /api/courses:
+ *   post:
+ *     summary: Створення нового курсу
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             $ref: '#/components/schemas/Course'
+ *     responses:
+ *       200:
+ *         description: Курс створено
+ *       500:
+ *         description: Помилка при додаванні курсу
+ */
+router.post("/", authenticateJWT, (req, res) => {
+    const { title, description, instructor } = req.body;
+    const query = "INSERT INTO courses (title, description, instructor) VALUES (?, ?, ?)";
+    db.query(query, [title, description, instructor], (err, result) => {
+      if (err) return res.status(500).json({ message: "Помилка при додаванні курсу" });
+      res.json({ message: "Курс додано", id: result.insertId });
+    });
+  });
+
+/**
+ * @swagger
+ * /api/courses:
+ *   get:
+ *     summary: Отримання всіх курсів
+ *     responses:
+ *       200:
+ *         description: Список курсів
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: array
+ *               items:
+ *                 $ref: '#/components/schemas/Course'
+ *       500:
+ *         description: Помилка при отриманні курсів
+ */
+router.get("/", (req, res) => {
+  const query = "SELECT * FROM courses";
+  db.query(query, (err, results) => {
+    if (err) return res.status(500).json({ message: "Помилка при отриманні курсів" });
+    res.json(results);
+  });
+});
+
+/**
+ * @swagger
+ * /api/courses/{id}:
+ *   get:
+ *     summary: Отримання курсу за ID
+ *     parameters:
+ *       - in: path
+ *         name: id
+ *         required: true
+ *         schema:
+ *           type: integer
+ *         description: ID курсу
+ *     responses:
+ *       200:
+ *         description: Курс знайдено
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/Course'
+ *       404:
+ *         description: Курс не знайдено
+ *       500:
+ *         description: Помилка при отриманні курсу
+ */
+router.get("/:id", (req, res) => {
+  const { id } = req.params;
+  const query = "SELECT * FROM courses WHERE id = ?";
+  db.query(query, [id], (err, result) => {
+    if (err) return res.status(500).json({ message: "Помилка при отриманні курсу" });
+    if (result.length === 0) return res.status(404).json({ message: "Курс не знайдено" });
+    res.json(result[0]);
+  });
+});
+
+/**
+ * @swagger
+ * /api/courses/{id}:
+ *   put:
+ *     summary: Оновлення інформації про курс
+ *     parameters:
+ *       - in: path
+ *         name: id
+ *         required: true
+ *         schema:
+ *           type: integer
+ *         description: ID курсу
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             $ref: '#/components/schemas/Course'
+ *     responses:
+ *       200:
+ *         description: Курс оновлено
+ *       404:
+ *         description: Курс не знайдено
+ *       500:
+ *         description: Помилка при оновленні курсу
+ */
+router.put("/:id", authenticateJWT, (req, res) => {
+  const { id } = req.params;
+  const { title, description, instructor } = req.body;
+  const query = "UPDATE courses SET title = ?, description = ?, instructor = ? WHERE id = ?";
+  db.query(query, [title, description, instructor, id], (err, result) => {
+    if (err) return res.status(500).json({ message: "Помилка при оновленні курсу" });
+    if (result.affectedRows === 0) return res.status(404).json({ message: "Курс не знайдено" });
+    res.json({ message: "Курс оновлено" });
+  });
+});
+
+/**
+ * @swagger
+ * /api/courses/{id}:
+ *   delete:
+ *     summary: Видалення курсу
+ *     parameters:
+ *       - in: path
+ *         name: id
+ *         required: true
+ *         schema:
+ *           type: integer
+ *         description: ID курсу
+ *     responses:
+ *       200:
+ *         description: Курс видалено
+ *       404:
+ *         description: Курс не знайдено
+ *       500:
+ *         description: Помилка при видаленні курсу
+ */
+router.delete("/:id", authenticateJWT, (req, res) => {
+  const { id } = req.params;
+  const query = "DELETE FROM courses WHERE id = ?";
+  db.query(query, [id], (err, result) => {
+    if (err) return res.status(500).json({ message: "Помилка при видаленні курсу" });
+    if (result.affectedRows === 0) return res.status(404).json({ message: "Курс не знайдено" });
+    res.json({ message: "Курс видалено" });
+  });
+});
+
+module.exports = router;
+
+
+
+
+
+
+
+const express = require("express");
+const bcrypt = require("bcryptjs");
+const jwt = require("jsonwebtoken");
+const db = require("../db"); // Підключення до БД
+const router = express.Router();
+
+// Реєстрація користувача
+router.post("/register", async (req, res) => {
+  const { username, email, password } = req.body;
+  const hashedPassword = await bcrypt.hash(password, 10);
+  const query = "INSERT INTO users (username, email, password) VALUES (?, ?, ?)";
+  db.query(query, [username, email, hashedPassword], (err, result) => {
+    if (err) return res.status(500).json({ message: "Помилка при реєстрації" });
+    res.json({ message: "Користувач створений" });
+  });
+});
+
+// Логін користувача
+router.post("/login", async (req, res) => {
+  const { email, password } = req.body;
+  const query = "SELECT * FROM users WHERE email = ?";
+  db.query(query, [email], async (err, results) => {
+    if (err || results.length === 0) return res.status(401).json({ message: "Невірні дані" });
+
+    const user = results[0];
+    const isPasswordValid = await bcrypt.compare(password, user.password);
+    if (!isPasswordValid) return res.status(401).json({ message: "Невірні дані" });
+
+    const token = jwt.sign({ id: user.id, role: user.role }, process.env.JWT_SECRET, { expiresIn: "1h" });
+    res.json({ token });
+  });
+});
+
+module.exports = router;
